@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/centrifugal/centrifuge-go"
+	"github.com/PatchSimple/centrifuge-go"
 	"go.uber.org/ratelimit"
 )
 
