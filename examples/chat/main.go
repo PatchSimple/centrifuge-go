@@ -11,7 +11,7 @@ import (
 
 	_ "net/http/pprof"
 
-	"github.com/centrifugal/centrifuge-go"
+	"github.com/PatchSimple/centrifuge-go"
 	"github.com/golang-jwt/jwt"
 )
 

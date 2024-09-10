@@ -6,7 +6,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 
-	"github.com/centrifugal/centrifuge-go"
+	"github.com/PatchSimple/centrifuge-go"
 )
 
 func newClient() *centrifuge.Client {
