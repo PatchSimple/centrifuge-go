@@ -191,10 +191,12 @@ func (c *Client) Close(ctx context.Context) error {
 
 // State returns current Client state. Note that while you are processing
 // this state - Client can move to a new one.
-func (c *Client) State() State {
-	c.mu.Lock() // was c.mu.RLock()
+func (c *Client) State(ctx context.Context) (State, error) {
+	if err := c.mu.TryLockCtx(ctx); err != nil { // was c.mu.RLock()
+		return "", fmt.Errorf("failed to obtain lock for getState: %w", err)
+	}
 	defer c.mu.Unlock()
-	return c.state
+	return c.state, nil
 }
 
 // SetToken allows updating Client's connection token.
