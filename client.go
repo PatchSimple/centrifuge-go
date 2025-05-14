@@ -641,6 +641,7 @@ func (c *Client) handleDisconnect(d *disconnect) {
 			Reason:    "transport closed",
 			Reconnect: true,
 		}
+		slog.Debug("centrifuge client disconnect handler received nil disconnect", "default", d)
 	}
 	if d.Reconnect {
 		c.moveToConnecting(d.Code, d.Reason)
@@ -666,6 +667,7 @@ func (c *Client) waitServerPing(disconnectCh chan struct{}, pingInterval uint32)
 func (c *Client) readOnce(t transport) error {
 	reply, disconnect, err := t.Read()
 	if err != nil {
+		slog.Debug("centrifuge client failed to read from transport", "reason", err, "disconnect", disconnect)
 		go c.handleDisconnect(disconnect)
 		return err
 	}
