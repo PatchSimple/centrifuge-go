@@ -631,3 +631,19 @@ func TestClient_stateEq(t *testing.T) {
 		t.Fatalf("expected state to be disconnected")
 	}
 }
+
+func TestClient_Close(t *testing.T) {
+	client := NewJsonClient("ws://localhost:8000/connection/websocket?cf_protocol_version=v2", Config{})
+	if err := client.Connect(newCtx(t)); err != nil {
+		t.Fatalf("error on connect: %v", err)
+	}
+	time.Sleep(time.Second * 5)
+	err := client.Close(newCtx(t))
+	if err != nil {
+		t.Fatalf("error on close: %v", err)
+	}
+	state := client.State()
+	if state != StateClosed {
+		t.Fatalf("expected state to be closed, got %v", state)
+	}
+}
