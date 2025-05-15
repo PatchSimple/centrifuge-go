@@ -642,8 +642,67 @@ func TestClient_Close(t *testing.T) {
 	if err != nil {
 		t.Fatalf("error on close: %v", err)
 	}
-	state := client.State()
+	state, err := client.State(newCtx(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if state != StateClosed {
 		t.Fatalf("expected state to be closed, got %v", state)
 	}
+}
+
+func TestClient_Close_respects_context(t *testing.T) {
+	client := &Client{
+		mu: mutex.New(),
+	}
+	client.mu.Lock() // simulate deadlock
+	defer client.mu.Unlock()
+	ctx, cancel := context.WithCancel(newCtx(t))
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cancel()
+	}()
+	err := client.Close(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled error, got %v", err)
+	}
+	wg.Wait()
+}
+
+func TestClient_State(t *testing.T) {
+	client := &Client{
+		mu: mutex.New(),
+	}
+	client.state = StateDisconnected
+	state, err := client.State(newCtx(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if state != StateDisconnected {
+		t.Fatalf("expected state to be disconnected")
+	}
+}
+
+func TestClient_State_respects_context(t *testing.T) {
+	client := &Client{
+		mu: mutex.New(),
+	}
+	client.mu.Lock() // simulate deadlock
+	defer client.mu.Unlock()
+	ctx, cancel := context.WithCancel(newCtx(t))
+	defer cancel()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cancel()
+	}()
+	_, err := client.State(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled error, got %v", err)
+	}
+	wg.Wait()
 }
