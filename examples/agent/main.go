@@ -153,8 +153,16 @@ func runTokenExec(execPath string) (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+// internal codes
 const (
+	// codeDisconnectCalled is the code used to indicate that the disconnect was
+	// called explicitly by the client.
 	codeDisconnectCalled = 0
+)
+
+const (
+	defaultPublishInterval    = time.Minute * 5
+	defaultStateCheckInterval = time.Minute
 )
 
 type CentrifugeClientConnector struct {
@@ -172,8 +180,8 @@ func newCentrifugeClientConnector(connURL string, channel string, msg string, co
 		config:             config,
 		channel:            channel,
 		message:            msg,
-		publishInterval:    time.Minute * 5,
-		stateCheckInterval: time.Minute,
+		publishInterval:    defaultPublishInterval,
+		stateCheckInterval: defaultStateCheckInterval,
 	}
 }
 
@@ -223,15 +231,17 @@ func (c *CentrifugeClientConnector) newCentrifugeClient() (client *centrifuge.Cl
 }
 
 func (c *CentrifugeClientConnector) run(ctx context.Context) error {
-	slog.Info("CentrifugeClientConnector is starting to run")
+	runID := time.Now().Format(time.RFC3339Nano)
+	logger := slog.With("runID", runID)
+	logger.Info("CentrifugeClientConnector is starting to run")
 	defer func() {
-		slog.Info("CentrifugeClientConnector is shutting down")
+		logger.Info("CentrifugeClientConnector is shutting down")
 	}()
 	// Construct the client.
-	slog.Debug("CentrifugeClientConnector is building a new centrifuge client")
+	logger.Debug("CentrifugeClientConnector is building a new centrifuge client")
 	client, disconnectSignals := c.newCentrifugeClient()
 	// Start connecting.
-	slog.Info("CentrifugeClientConnector is starting to connect to server", "url", c.connURL)
+	logger.Info("CentrifugeClientConnector is starting to connect to server", "url", c.connURL)
 	if err := client.Connect(); err != nil {
 		return fmt.Errorf("failed to connect to server: %w", err)
 	}
@@ -243,6 +253,11 @@ func (c *CentrifugeClientConnector) run(ctx context.Context) error {
 	defer stateCheckTicker.Stop()
 	// Run forever unless the context is canceled, the client is closed, or
 	// fails to start connecting again.
+	logger.Info(
+		"CentrifugeClientConnector will begin looping",
+		"publishInterval", c.publishInterval.String(),
+		"stateCheckInterval", c.stateCheckInterval.String(),
+	)
 	for {
 		select {
 		// Stop because the context was canceled.
@@ -257,24 +272,24 @@ func (c *CentrifugeClientConnector) run(ctx context.Context) error {
 				return ctx.Err()
 			default:
 			}
-			slog.Debug("CentrifugeClientConnector will attempt to reconnect to server", "currentState", client.State())
+			logger.Debug("CentrifugeClientConnector will attempt to reconnect to server", "currentState", client.State())
 			if err := client.Connect(); err != nil {
 				return fmt.Errorf("failed to connect to server: %w", err)
 			}
-			slog.Debug("CentrifugeClientConnector started reconnecting", "currentState", client.State())
+			logger.Debug("CentrifugeClientConnector started reconnecting", "currentState", client.State())
 		// Check the state of the client.
 		case <-publishTicker.C:
-			slog.Debug("CentrifugeClientConnector is checking the state of the client", "currentState", client.State())
+			logger.Debug("CentrifugeClientConnector is checking the state of the client", "currentState", client.State())
 		// Do a publish to check.
 		case <-publishTicker.C:
-			slog.Debug("CentrifugeClientConnector is attempting to publish message", "currentState", client.State())
+			logger.Debug("CentrifugeClientConnector is attempting to publish message", "currentState", client.State())
 			if _, err := client.Publish(ctx, c.channel, []byte(c.message)); err != nil {
-				slog.Error("CentrifugeClientConnector failed to publish message", "reason", err, "currentState", client.State())
+				logger.Error("CentrifugeClientConnector failed to publish message", "reason", err, "currentState", client.State())
 				if errors.Is(err, centrifuge.ErrClientClosed) {
 					return fmt.Errorf("client closed: %w", err)
 				}
 			}
-			slog.Debug("CentrifugeClientConnector succeeded in publishing message")
+			logger.Debug("CentrifugeClientConnector succeeded in publishing message")
 		}
 	}
 }
