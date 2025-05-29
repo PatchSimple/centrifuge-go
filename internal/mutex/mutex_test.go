@@ -1,8 +1,10 @@
 package mutex
 
 import (
+	"errors"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -14,8 +16,17 @@ func newTestMutex() *KamikazeMutex {
 
 func TestKamikazeMutex_LockUnlock(t *testing.T) {
 	m := newTestMutex()
+	if len(m.x) != 0 {
+		t.Fatalf("expected mutex to be unlocked, got %d", len(m.x))
+	}
 	m.Lock()
-	m.Unlock() //nolint:staticcheck // Sis is intentional to test the mutex behavior
+	if len(m.x) != 1 {
+		t.Fatalf("expected mutex to be locked, got %d", len(m.x))
+	}
+	m.Unlock()
+	if len(m.x) != 0 {
+		t.Fatalf("expected mutex to be unlocked, got %d", len(m.x))
+	}
 }
 
 func TestKamikazeMutex_UnlockWithoutLockPanics(t *testing.T) {
@@ -49,18 +60,18 @@ func main() {
 	os.Exit(0) // should not reach here
 }
 `
-	tmp := t.TempDir() + "/main.go"
+	tmp := filepath.Join(t.TempDir(), "main.go")
 	if err := os.WriteFile(tmp, []byte(code), 0644); err != nil {
-		t.Fatal(err)
+		t.Fatalf("failed to write temporary file: %v", err)
 	}
 	cmd := exec.Command("go", "run", tmp)
 	err := cmd.Run()
-	if exitErr, ok := err.(*exec.ExitError); ok {
-		if exitErr.ExitCode() != 1 {
-			t.Fatalf("expected exit code 1, got %d", exitErr.ExitCode())
-		}
-	} else {
+	exitErr := new(exec.ExitError)
+	if !errors.As(err, &exitErr) {
 		t.Fatalf("expected process to exit with error, got %v", err)
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got %d", exitErr.ExitCode())
 	}
 }
 
