@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/centrifugal/centrifuge-go/internal/mutex"
 	"github.com/centrifugal/protocol"
 	fossil "github.com/shadowspore/fossil-delta"
 )
@@ -52,34 +52,12 @@ type SubscriptionConfig struct {
 	Delta DeltaType
 }
 
-func newSubscription(c *Client, channel string, config ...SubscriptionConfig) *Subscription {
-	s := &Subscription{
-		Channel:             channel,
-		centrifuge:          c,
-		state:               SubStateUnsubscribed,
-		events:              newSubscriptionEventHub(),
-		subFutures:          make(map[uint64]subFuture),
-		resubscribeStrategy: defaultBackoffReconnect,
-	}
-	if len(config) == 1 {
-		cfg := config[0]
-		s.token = cfg.Token
-		s.getToken = cfg.GetToken
-		s.data = cfg.Data
-		s.positioned = cfg.Positioned
-		s.recoverable = cfg.Recoverable
-		s.joinLeave = cfg.JoinLeave
-		s.deltaType = cfg.Delta
-	}
-	return s
-}
-
 // Subscription represents client subscription to channel. DO NOT initialize this struct
 // directly, instead use Client.NewSubscription method to create channel subscriptions.
 type Subscription struct {
 	futureID uint64 // Keep atomic on top!
 
-	mu         sync.RWMutex
+	mu         *mutex.KamikazeMutex
 	centrifuge *Client
 
 	// Channel for a subscription.
@@ -110,6 +88,29 @@ type Subscription struct {
 	deltaType       DeltaType
 	deltaNegotiated bool
 	prevData        []byte
+}
+
+func newSubscription(c *Client, channel string, config ...SubscriptionConfig) *Subscription {
+	s := &Subscription{
+		Channel:             channel,
+		centrifuge:          c,
+		state:               SubStateUnsubscribed,
+		events:              newSubscriptionEventHub(),
+		subFutures:          make(map[uint64]subFuture),
+		resubscribeStrategy: defaultBackoffReconnect,
+		mu:                  mutex.NewKamikazeMutex(defaultDeadlockTimeout),
+	}
+	if len(config) == 1 {
+		cfg := config[0]
+		s.token = cfg.Token
+		s.getToken = cfg.GetToken
+		s.data = cfg.Data
+		s.positioned = cfg.Positioned
+		s.recoverable = cfg.Recoverable
+		s.joinLeave = cfg.JoinLeave
+		s.deltaType = cfg.Delta
+	}
+	return s
 }
 
 func (s *Subscription) State() SubState {
