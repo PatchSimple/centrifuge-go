@@ -8,9 +8,9 @@ import (
 )
 
 // KamikazeMutex is a drop-in replacement for sync.Mutex. It calls os.Exit if a
-// lock can not be acquired within the specified timeout.
+// lock cannot be acquired within the specified timeout.
 type KamikazeMutex struct {
-	x       chan struct{} // if len(x) == 1 then locked
+	x       chan struct{} // If len(x) == 1, then the mutex is locked.
 	timeout time.Duration
 }
 
@@ -21,8 +21,8 @@ func NewKamikazeMutex(timeout time.Duration) *KamikazeMutex {
 	}
 }
 
-// lock will block until the lock can be acquired or the timeout is reached. If
-// the timeout is reached, it panics.
+// Lock will block until the lock can be acquired or the timeout is reached. If
+// the timeout is reached, it calls os.Exit.
 func (m *KamikazeMutex) Lock() {
 	select {
 	case <-time.After(m.timeout):
@@ -33,7 +33,7 @@ func (m *KamikazeMutex) Lock() {
 		)
 		os.Exit(1)
 	case m.x <- struct{}{}:
-		// lock acquired
+		// Lock acquired.
 	}
 }
 
@@ -45,12 +45,15 @@ func (m *KamikazeMutex) Unlock() {
 	}
 }
 
-// RLock is just a placeholder for compatibility. its really just a normal lock.
+// RLock is a placeholder for compatibility. It is functionally equivalent to a
+// normal lock.
 func (m *KamikazeMutex) RLock() bool {
 	m.Lock()
 	return true
 }
 
+// RUnlock is a placeholder for compatibility. It is functionally equivalent to
+// a normal unlock.
 func (m *KamikazeMutex) RUnlock() {
 	m.Unlock()
 }
