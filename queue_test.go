@@ -4,6 +4,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/centrifugal/centrifuge-go/internal/mutex"
 )
 
 func assertTrue(t *testing.T, condition bool, msg string) {
@@ -21,8 +23,9 @@ func assertEqual(t *testing.T, expected, actual interface{}, msg string) {
 func newTestQueue() *cbQueue {
 	q := &cbQueue{
 		closeCh: make(chan struct{}),
+		mu:      mutex.NewKamikazeMutex(defaultDeadlockTimeout),
 	}
-	q.cond = sync.NewCond(&q.mu)
+	q.cond = sync.NewCond(q.mu)
 	return q
 }
 
