@@ -26,13 +26,15 @@ func NewKamikazeMutex(timeout time.Duration) *KamikazeMutex {
 func (m *KamikazeMutex) Lock() {
 	select {
 	case <-time.After(m.timeout):
-		stackTrace := debug.Stack()
 		slog.Error("deadlock detected",
 			"timeout", m.timeout.String(),
-			"stack_trace", stackTrace,
+			"stackTrace", debug.Stack(),
 		)
 		os.Exit(1)
 	case m.x <- struct{}{}:
+		slog.Info("lock acquired",
+			"stackTrace", debug.Stack(),
+		)
 		// Lock acquired.
 	}
 }
@@ -40,6 +42,9 @@ func (m *KamikazeMutex) Lock() {
 func (m *KamikazeMutex) Unlock() {
 	select {
 	case <-m.x:
+		slog.Info("lock released",
+			"stackTrace", debug.Stack(),
+		)
 	default:
 		panic("mutex is not locked")
 	}
