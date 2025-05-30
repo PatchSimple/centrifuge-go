@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/centrifugal/centrifuge-go/internal/mutex"
 	"github.com/centrifugal/protocol"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -29,6 +30,8 @@ const (
 	StateClosed       State = "closed"
 )
 
+const defaultDeadlockTimeout time.Duration = 5 * time.Minute
+
 // Client represents client connection to Centrifugo or Centrifuge
 // library based server. It provides methods to set various event
 // handlers, subscribe channels, call RPC commands etc. Call client
@@ -38,7 +41,7 @@ const (
 type Client struct {
 	futureID          uint64
 	cmdID             uint32
-	mu                sync.RWMutex
+	mu                *mutex.KamikazeMutex
 	endpoints         []string
 	round             int
 	protocolType      protocol.Type
@@ -50,7 +53,7 @@ type Client struct {
 	state             State
 	subs              map[string]*Subscription
 	serverSubs        map[string]*serverSub
-	requestsMu        sync.RWMutex
+	requestsMu        *mutex.KamikazeMutex
 	requests          map[uint32]request
 	receive           chan []byte
 	reconnectAttempts int
@@ -196,13 +199,13 @@ func newClient(endpoint string, isProtobuf bool, config Config) *Client {
 		data:              config.Data,
 		logCh:             make(chan LogEntry, 256),
 		logCloseCh:        make(chan struct{}),
+		mu:                mutex.NewKamikazeMutex(defaultDeadlockTimeout),
+		requestsMu:        mutex.NewKamikazeMutex(defaultDeadlockTimeout),
 	}
 
 	// Queue to run callbacks on.
-	client.cbQueue = &cbQueue{
-		closeCh: make(chan struct{}),
-	}
-	client.cbQueue.cond = sync.NewCond(&client.cbQueue.mu)
+	client.cbQueue = newCBQueue()
+	client.cbQueue.cond = sync.NewCond(client.cbQueue.mu)
 	go client.cbQueue.dispatch()
 	if client.config.LogLevel > 0 {
 		go client.handleLogs()

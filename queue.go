@@ -3,6 +3,8 @@ package centrifuge
 import (
 	"sync"
 	"time"
+
+	"github.com/centrifugal/centrifuge-go/internal/mutex"
 )
 
 // cbQueue allows processing callbacks in separate goroutine with
@@ -11,12 +13,20 @@ import (
 // https://github.com/nats-io/nats.go client released under Apache 2.0
 // license: see https://github.com/nats-io/nats.go/blob/master/LICENSE.
 type cbQueue struct {
-	mu      sync.Mutex
+	mu      *mutex.KamikazeMutex
 	cond    *sync.Cond
 	head    *asyncCB
 	tail    *asyncCB
 	closeCh chan struct{}
 	closed  bool
+}
+
+func newCBQueue() *cbQueue {
+	q := &cbQueue{
+		mu:      mutex.NewKamikazeMutex(defaultDeadlockTimeout),
+		closeCh: make(chan struct{}),
+	}
+	return q
 }
 
 type asyncCB struct {
