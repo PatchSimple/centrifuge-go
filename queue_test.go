@@ -18,16 +18,8 @@ func assertEqual(t *testing.T, expected, actual interface{}, msg string) {
 	}
 }
 
-func newTestQueue() *cbQueue {
-	q := &cbQueue{
-		closeCh: make(chan struct{}),
-	}
-	q.cond = sync.NewCond(&q.mu)
-	return q
-}
-
 func TestCbQueue_PushAndDispatch(t *testing.T) {
-	q := newTestQueue()
+	q := newCBQueue(1)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -50,7 +42,7 @@ func TestCbQueue_PushAndDispatch(t *testing.T) {
 }
 
 func TestCbQueue_OrderPreservation(t *testing.T) {
-	q := newTestQueue()
+	q := newCBQueue(1)
 
 	// Start the dispatcher in a separate goroutine.
 	go q.dispatch()
@@ -80,30 +72,22 @@ func TestCbQueue_OrderPreservation(t *testing.T) {
 }
 
 func TestCbQueue_Close(t *testing.T) {
-	q := newTestQueue()
-
+	q := newCBQueue(1)
 	go q.dispatch()
-
 	var executed bool
+	var wg sync.WaitGroup
+	wg.Add(1)
 	q.push(func(d time.Duration) {
+		defer wg.Done()
 		executed = true
 	})
-
 	q.close()
-
-	// Ensure the closeCh channel is closed.
-	select {
-	case <-q.closeCh:
-		// Channel was closed as expected.
-	case <-time.After(1 * time.Second):
-		t.Fatal("closeCh was not closed after queue close")
-	}
-
+	wg.Wait()
 	assertTrue(t, executed, "Callback should be executed before close")
 }
 
 func TestCbQueue_IgnorePushAfterClose(t *testing.T) {
-	q := newTestQueue()
+	q := newCBQueue(1)
 	go q.dispatch()
 	q.close()
 
@@ -116,16 +100,4 @@ func TestCbQueue_IgnorePushAfterClose(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	assertTrue(t, !executed, "Callback should not be executed after queue close")
-}
-
-func TestCbQueue_PushNilCallbackPanics(t *testing.T) {
-	q := newTestQueue()
-
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("Expected panic when pushing nil callback with close set to false")
-		}
-	}()
-
-	q.pushOrClose(nil, false)
 }

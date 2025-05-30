@@ -1,96 +1,95 @@
 package centrifuge
 
 import (
-	"sync"
+	"context"
+	"sync/atomic"
 	"time"
 )
 
 // cbQueue allows processing callbacks in separate goroutine with
 // preserved order.
-// This queue implementation is a slightly modified code borrowed from
-// https://github.com/nats-io/nats.go client released under Apache 2.0
-// license: see https://github.com/nats-io/nats.go/blob/master/LICENSE.
 type cbQueue struct {
-	mu      sync.Mutex
-	cond    *sync.Cond
-	head    *asyncCB
-	tail    *asyncCB
-	closeCh chan struct{}
-	closed  bool
+	callbacks *List[*asyncCB] // Using a List to preserve order and allow blocking operations.
+	closeCh   chan struct{}   // Channel to signal that the queue is closed.
+	closed    atomic.Bool     // Atomic boolean to check if the queue is closed.
+}
+
+func newCBQueue(buffSize int) *cbQueue {
+	return &cbQueue{
+		callbacks: NewList[*asyncCB](),
+		closeCh:   make(chan struct{}),
+	}
 }
 
 type asyncCB struct {
-	fn   func(delay time.Duration)
-	tm   time.Time
-	next *asyncCB
+	ready chan chan struct{} // Channel to signal that the callback is ready to be executed.
 }
 
 // dispatch is responsible for calling async callbacks. Should be run
 // in separate goroutine.
 func (q *cbQueue) dispatch() {
 	for {
-		q.mu.Lock()
-		// Protect for spurious wake-ups. We should get out of the
-		// wait only if there is an element to pop from the list.
-		for q.head == nil {
-			q.cond.Wait()
-		}
-		curr := q.head
-		q.head = curr.next
-		if curr == q.tail {
-			q.tail = nil
-		}
-		q.mu.Unlock()
-
-		// This signals that the dispatcher has been closed and all
-		// previous callbacks have been dispatched.
-		if curr.fn == nil {
-			close(q.closeCh)
+		select {
+		case <-q.closeCh:
 			return
+		default:
+			q.dispatchOne()
 		}
-		curr.fn(time.Since(curr.tm))
+	}
+}
+
+func (q *cbQueue) dispatchOne() {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer cancel()
+		<-q.closeCh
+	}()
+	v, err := q.callbacks.PopFrontCtx(ctx)
+	if err != nil {
+		return
+	}
+	// signal that we are ready to execute the callback
+	done := make(chan struct{})
+	select {
+	case <-ctx.Done():
+		return
+	case v.ready <- done:
+	}
+
+	// wait for fn to finish
+	select {
+	case <-ctx.Done():
+		return
+	case <-done:
 	}
 }
 
 // Push adds the given function to the tail of the list and
 // signals the dispatcher.
 func (q *cbQueue) push(f func(duration time.Duration)) {
-	q.pushOrClose(f, false)
+	select {
+	case <-q.closeCh:
+		return
+	default:
+	}
+	start := time.Now()
+	cb := &asyncCB{ready: make(chan chan struct{}, 1)}
+	q.callbacks.PushBack(cb)
+	if done, ok := <-cb.ready; ok {
+		f(time.Since(start))
+		close(done)
+	}
 }
 
 // Close signals that async queue must be closed.
 // Queue won't accept any more callbacks after that – ignoring them if pushed.
 func (q *cbQueue) close() {
-	q.pushOrClose(nil, true)
-	q.waitClose()
-}
-
-func (q *cbQueue) waitClose() {
-	<-q.closeCh
-}
-
-func (q *cbQueue) pushOrClose(f func(time.Duration), close bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.closed {
-		return
+	if q.closed.Swap(true) {
+		return // Already closed, do nothing.
 	}
-	// Make sure that library is not calling push with nil function,
-	// since this is used to notify the dispatcher that it must stop.
-	if !close && f == nil {
-		panic("pushing a nil callback with false close")
-	}
-	cb := &asyncCB{fn: f, tm: time.Now()}
-	if q.tail != nil {
-		q.tail.next = cb
-	} else {
-		q.head = cb
-	}
-	q.tail = cb
-	if close {
-		q.closed = true
-		q.cond.Broadcast()
-	} else {
-		q.cond.Signal()
+	close(q.closeCh)
+	// Drain the queue to ensure all callbacks are processed before closing.
+	for q.callbacks.Len() > 0 {
+		q.dispatchOne()
 	}
 }
