@@ -2,17 +2,20 @@ package centrifuge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/centrifugal/protocol"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 // State of client connection.
@@ -61,6 +64,9 @@ type Client struct {
 	reconnectTimer    *time.Timer
 	refreshTimer      *time.Timer
 	refreshRequired   bool
+	logCh             chan LogEntry
+	logCloseCh        chan struct{}
+	logCloseOnce      sync.Once
 }
 
 // NewJsonClient initializes Client which uses JSON-based protocol internally.
@@ -79,6 +85,58 @@ func NewJsonClient(endpoint string, config Config) *Client {
 // NewProtobufClient will panic.
 func NewProtobufClient(endpoint string, config Config) *Client {
 	return newClient(endpoint, true, config)
+}
+
+func (c *Client) logLevelEnabled(level LogLevel) bool {
+	return level >= c.config.LogLevel
+}
+
+func (c *Client) log(level LogLevel, message string, fields map[string]string) {
+	logEntry := LogEntry{
+		Level:   level,
+		Message: message,
+		Fields:  fields,
+	}
+	select {
+	case c.logCh <- logEntry:
+	default:
+		// If log channel is full, drop the log entry.
+	}
+}
+
+func (c *Client) handleLogs() {
+	for {
+		select {
+		case entry := <-c.logCh:
+			c.config.LogHandler(entry)
+		case <-c.logCloseCh:
+			return
+		}
+	}
+}
+
+func (c *Client) traceOutCmd(cmd *protocol.Command) {
+	jsonBytes, err := json.Marshal(cmd)
+	if err != nil {
+		jsonBytes, _ = protojson.Marshal(cmd)
+	}
+	c.log(LogLevelTrace, "-out->", map[string]string{"command": string(jsonBytes)})
+}
+
+func (c *Client) traceInReply(rep *protocol.Reply) {
+	jsonBytes, err := json.Marshal(rep)
+	if err != nil {
+		jsonBytes, _ = protojson.Marshal(rep)
+	}
+	c.log(LogLevelTrace, "<-in--", map[string]string{"reply": string(jsonBytes)})
+}
+
+func (c *Client) traceInPush(push *protocol.Push) {
+	jsonBytes, err := json.Marshal(push)
+	if err != nil {
+		jsonBytes, _ = protojson.Marshal(push)
+	}
+	c.log(LogLevelTrace, "<-in--", map[string]string{"push": string(jsonBytes)})
 }
 
 func newClient(endpoint string, isProtobuf bool, config Config) *Client {
@@ -136,12 +194,16 @@ func newClient(endpoint string, isProtobuf bool, config Config) *Client {
 		connectFutures:    make(map[uint64]connectFuture),
 		token:             config.Token,
 		data:              config.Data,
+		logCh:             make(chan LogEntry, 256),
+		logCloseCh:        make(chan struct{}),
 	}
 
 	// Queue to run callbacks on.
 	client.cbQueue = newCBQueue(1)
 	go client.cbQueue.dispatch()
-
+	if client.config.LogLevel > 0 {
+		go client.handleLogs()
+	}
 	return client
 }
 
@@ -170,6 +232,9 @@ func (c *Client) Close() {
 	}
 	c.moveToDisconnected(disconnectedDisconnectCalled, "disconnect called")
 	c.moveToClosed()
+	c.logCloseOnce.Do(func() {
+		close(c.logCloseCh)
+	})
 }
 
 // State returns current Client state. Note that while you are processing
@@ -424,19 +489,42 @@ func (c *Client) moveToDisconnected(code uint32, reason string) {
 }
 
 func (c *Client) moveToConnecting(code uint32, reason string) {
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "moving client to connecting state", map[string]string{
+			"code":   strconv.Itoa(int(code)),
+			"reason": reason,
+		})
+	}
 	c.mu.Lock()
 	if c.state == StateDisconnected || c.state == StateClosed || c.state == StateConnecting {
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "client already in state that does not require extra work", map[string]string{
+				"state": string(c.state),
+			})
+		}
 		c.mu.Unlock()
 		return
 	}
 	if c.transport != nil {
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "closing non-nil transport", nil)
+		}
 		_ = c.transport.Close()
 		c.transport = nil
 	}
 
 	c.state = StateConnecting
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "client moved to connecting state", nil)
+	}
 	c.clearConnectedState()
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "cleared connected state", nil)
+	}
 	c.resolveConnectFutures(ErrClientDisconnected)
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "resolved connect futures", nil)
+	}
 
 	subsToUnsubscribe := make([]*Subscription, 0, len(c.subs))
 	for _, s := range c.subs {
@@ -457,6 +545,11 @@ func (c *Client) moveToConnecting(code uint32, reason string) {
 	for _, s := range subsToUnsubscribe {
 		s.moveToSubscribing(subscribingTransportClosed, "transport closed")
 	}
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "client-side subs unsubscribe events called", map[string]string{
+			"num_subs": strconv.Itoa(len(subsToUnsubscribe)),
+		})
+	}
 
 	var serverSubscribingHandler ServerSubscribingHandler
 	if c.events != nil && c.events.onServerSubscribing != nil {
@@ -467,6 +560,11 @@ func (c *Client) moveToConnecting(code uint32, reason string) {
 			for _, ch := range serverSubsToUnsubscribe {
 				serverSubscribingHandler(ServerSubscribingEvent{Channel: ch})
 			}
+		})
+	}
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "server-side subs unsubscribe events called", map[string]string{
+			"num_subs": strconv.Itoa(len(serverSubsToUnsubscribe)),
 		})
 	}
 
@@ -480,18 +578,38 @@ func (c *Client) moveToConnecting(code uint32, reason string) {
 			handler(event)
 		})
 	}
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "connecting event called", nil)
+	}
 
 	c.mu.Lock()
 	if c.state != StateConnecting {
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "not in connecting state, no need to reconnect", map[string]string{
+				"state": string(c.state),
+			})
+		}
 		c.mu.Unlock()
 		return
 	}
+	c.scheduleReconnectLocked()
+	c.mu.Unlock()
+}
+
+func (c *Client) scheduleReconnectLocked() {
 	c.reconnectAttempts++
 	reconnectDelay := c.getReconnectDelay()
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "reconnect with delay", map[string]string{
+			"delay": reconnectDelay.String(),
+		})
+	}
 	c.reconnectTimer = time.AfterFunc(reconnectDelay, func() {
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "reconnect timer fired, start reconnecting", nil)
+		}
 		_ = c.startReconnecting()
 	})
-	c.mu.Unlock()
 }
 
 func (c *Client) moveToClosed() {
@@ -659,6 +777,9 @@ func (c *Client) runHandlerAsync(fn func()) {
 
 func (c *Client) handle(reply *protocol.Reply) {
 	if reply.Id > 0 {
+		if c.logLevelEnabled(LogLevelTrace) {
+			c.traceInReply(reply)
+		}
 		c.requestsMu.RLock()
 		req, ok := c.requests[reply.Id]
 		c.requestsMu.RUnlock()
@@ -670,6 +791,9 @@ func (c *Client) handle(reply *protocol.Reply) {
 		c.removeRequest(reply.Id)
 	} else {
 		if reply.Push == nil {
+			if c.logLevelEnabled(LogLevelTrace) {
+				c.traceInReply(reply)
+			}
 			// Ping from server, send pong if needed.
 			select {
 			case c.delayPing <- struct{}{}:
@@ -683,6 +807,9 @@ func (c *Client) handle(reply *protocol.Reply) {
 				_ = c.send(cmd)
 			}
 			return
+		}
+		if c.logLevelEnabled(LogLevelTrace) {
+			c.traceInPush(reply.Push)
 		}
 		c.mu.Lock()
 		if c.state != StateConnected {
@@ -890,6 +1017,11 @@ func (c *Client) startReconnecting() error {
 	c.round++
 	round := c.round
 	if c.state != StateConnecting {
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "not in connecting state, no need to reconnect", map[string]string{
+				"state": string(c.state),
+			})
+		}
 		c.mu.Unlock()
 		return nil
 	}
@@ -909,49 +1041,78 @@ func (c *Client) startReconnecting() error {
 	}
 
 	u := c.endpoints[round%len(c.endpoints)]
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "creating new transport", nil)
+	}
 	t, err := newWebsocketTransport(u, c.protocolType, wsConfig)
 	if err != nil {
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "error creating new transport", map[string]string{
+				"error": err.Error(),
+			})
+		}
 		c.handleError(TransportError{err})
 		c.mu.Lock()
 		if c.state != StateConnecting {
+			if c.logLevelEnabled(LogLevelDebug) {
+				c.log(LogLevelDebug, "not in connecting state, no need to reconnect", map[string]string{
+					"state": string(c.state),
+				})
+			}
 			c.mu.Unlock()
 			return nil
 		}
-		c.reconnectAttempts++
-		reconnectDelay := c.getReconnectDelay()
-		c.reconnectTimer = time.AfterFunc(reconnectDelay, func() {
-			_ = c.startReconnecting()
-		})
+		c.scheduleReconnectLocked()
 		c.mu.Unlock()
 		return err
+	}
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "new transport created", nil)
 	}
 
 	if refreshRequired || (token == "" && getTokenFunc != nil) {
 		// Try to refresh token.
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "refreshing token", nil)
+		}
 		newToken, err := c.refreshToken()
 		if err != nil {
 			if errors.Is(err, ErrUnauthorized) {
+				if c.logLevelEnabled(LogLevelDebug) {
+					c.log(LogLevelDebug, "unauthorized error, move to disconnected", nil)
+				}
 				c.moveToDisconnected(disconnectedUnauthorized, "unauthorized")
 				return nil
+			}
+			if c.logLevelEnabled(LogLevelDebug) {
+				c.log(LogLevelDebug, "error refreshing token", map[string]string{
+					"error": err.Error(),
+				})
 			}
 			c.handleError(RefreshError{err})
 			c.mu.Lock()
 			if c.state != StateConnecting {
+				if c.logLevelEnabled(LogLevelDebug) {
+					c.log(LogLevelDebug, "not in connecting state, no need to continue", map[string]string{
+						"state": string(c.state),
+					})
+				}
 				_ = t.Close()
 				c.mu.Unlock()
 				return nil
 			}
-			c.reconnectAttempts++
-			reconnectDelay := c.getReconnectDelay()
-			c.reconnectTimer = time.AfterFunc(reconnectDelay, func() {
-				_ = c.startReconnecting()
-			})
+			c.scheduleReconnectLocked()
 			c.mu.Unlock()
 			return err
 		} else {
 			c.mu.Lock()
 			c.token = newToken
 			if c.state != StateConnecting {
+				if c.logLevelEnabled(LogLevelDebug) {
+					c.log(LogLevelDebug, "got token, but not in connecting state anymore", map[string]string{
+						"state": string(c.state),
+					})
+				}
 				c.mu.Unlock()
 				return nil
 			}
@@ -961,6 +1122,11 @@ func (c *Client) startReconnecting() error {
 
 	c.mu.Lock()
 	if c.state != StateConnecting {
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "not in connecting state, no need to reconnect", map[string]string{
+				"state": string(c.state),
+			})
+		}
 		_ = t.Close()
 		c.mu.Unlock()
 		return nil
@@ -972,55 +1138,95 @@ func (c *Client) startReconnecting() error {
 	c.disconnectedCh = disconnectCh
 
 	go c.reader(t, disconnectCh)
-
+	if c.logLevelEnabled(LogLevelDebug) {
+		c.log(LogLevelDebug, "started reader loop, sending connect frame", nil)
+	}
 	err = c.sendConnect(func(res *protocol.ConnectResult, err error) {
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "connect result received", nil)
+		}
 		c.mu.Lock()
 		if c.state != StateConnecting {
+			if c.logLevelEnabled(LogLevelDebug) {
+				c.log(LogLevelDebug, "not in connecting state, no need to continue", map[string]string{
+					"state": string(c.state),
+				})
+			}
 			c.mu.Unlock()
 			return
 		}
 		c.mu.Unlock()
 		if err != nil {
+			if c.logLevelEnabled(LogLevelDebug) {
+				c.log(LogLevelDebug, "connect error", map[string]string{
+					"error": err.Error(),
+				})
+			}
 			c.handleError(ConnectError{err})
 			_ = t.Close()
 			if isTokenExpiredError(err) {
 				c.mu.Lock()
 				defer c.mu.Unlock()
 				if c.state != StateConnecting {
+					if c.logLevelEnabled(LogLevelDebug) {
+						c.log(LogLevelDebug, "not in connecting state, no need to continue", map[string]string{
+							"state": string(c.state),
+						})
+					}
 					return
 				}
 				c.refreshRequired = true
-				c.reconnectAttempts++
-				reconnectDelay := c.getReconnectDelay()
-				c.reconnectTimer = time.AfterFunc(reconnectDelay, func() {
-					_ = c.startReconnecting()
-				})
+				c.scheduleReconnectLocked()
 				return
 			} else if isServerError(err) && !isTemporaryError(err) {
 				var serverError *Error
 				if errors.As(err, &serverError) {
+					if c.logLevelEnabled(LogLevelDebug) {
+						c.log(LogLevelDebug, "server error, move to disconnected", map[string]string{
+							"code":    strconv.Itoa(int(serverError.Code)),
+							"message": serverError.Message,
+						})
+					}
 					c.moveToDisconnected(serverError.Code, serverError.Message)
+				} else {
+					// Should not happen, but just in case.
+					if c.logLevelEnabled(LogLevelDebug) {
+						c.log(LogLevelDebug, "not a server error", map[string]string{
+							"error": err.Error(),
+						})
+					}
 				}
 				return
 			} else {
 				c.mu.Lock()
 				defer c.mu.Unlock()
 				if c.state != StateConnecting {
+					if c.logLevelEnabled(LogLevelDebug) {
+						c.log(LogLevelDebug, "not in connecting state, no need to continue", map[string]string{
+							"state": string(c.state),
+						})
+					}
 					return
 				}
-				c.reconnectAttempts++
-				reconnectDelay := c.getReconnectDelay()
-				c.reconnectTimer = time.AfterFunc(reconnectDelay, func() {
-					_ = c.startReconnecting()
-				})
+				c.scheduleReconnectLocked()
 				return
 			}
 		}
 		c.mu.Lock()
 		if c.state != StateConnecting {
+			if c.logLevelEnabled(LogLevelDebug) {
+				c.log(LogLevelDebug, "not in connecting state, no need to continue", map[string]string{
+					"state": string(c.state),
+				})
+			}
 			_ = t.Close()
 			c.mu.Unlock()
 			return
+		}
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "connect ok, move to connected", map[string]string{
+				"client_id": res.Client,
+			})
 		}
 		c.state = StateConnected
 
@@ -1028,6 +1234,9 @@ func (c *Client) startReconnecting() error {
 			c.refreshTimer = time.AfterFunc(time.Duration(res.Ttl)*time.Second, c.sendRefresh)
 		}
 		c.resolveConnectFutures(nil)
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "resolved connect futures", nil)
+		}
 		c.mu.Unlock()
 
 		if c.events != nil && c.events.onConnected != nil {
@@ -1040,6 +1249,9 @@ func (c *Client) startReconnecting() error {
 			c.runHandlerSync(func() {
 				handler(ev)
 			})
+		}
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "connected event called", nil)
 		}
 
 		var subscribeHandler ServerSubscribedHandler
@@ -1104,6 +1316,9 @@ func (c *Client) startReconnecting() error {
 				})
 			}
 		}
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "connect server-side subscriptions processed", nil)
+		}
 
 		for ch := range c.serverSubs {
 			if _, ok := res.Subs[ch]; !ok {
@@ -1118,32 +1333,58 @@ func (c *Client) startReconnecting() error {
 				}
 			}
 		}
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "connect server-side unsubscriptions processed", nil)
+		}
 
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		// Successfully connected – can reset reconnect attempts.
 		c.reconnectAttempts = 0
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "reset reconnect attempts counter", nil)
+		}
 
 		if c.state != StateConnected {
+			if c.logLevelEnabled(LogLevelDebug) {
+				c.log(LogLevelDebug, "not in connected state, no need to continue", map[string]string{
+					"state": string(c.state),
+				})
+			}
 			return
 		}
 
 		if res.Ping > 0 {
+			if c.logLevelEnabled(LogLevelDebug) {
+				c.log(LogLevelDebug, "start waiting server ping", map[string]string{
+					"ping": strconv.Itoa(int(res.Ping)),
+				})
+			}
 			c.sendPong = res.Pong
 			go c.waitServerPing(disconnectCh, res.Ping)
 		}
 		c.resubscribe()
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "client-side subscriptions resubscribe called", nil)
+		}
 	})
 	if err != nil {
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "error sending connect frame", map[string]string{
+				"error": err.Error(),
+			})
+		}
 		_ = t.Close()
-		c.reconnectAttempts++
-		reconnectDelay := c.getReconnectDelay()
-		c.reconnectTimer = time.AfterFunc(reconnectDelay, func() {
-			_ = c.startReconnecting()
-		})
-		c.handleError(ConnectError{err})
+		c.scheduleReconnectLocked()
+	} else {
+		if c.logLevelEnabled(LogLevelDebug) {
+			c.log(LogLevelDebug, "connect frame successfully sent", nil)
+		}
 	}
 	c.mu.Unlock()
+	if err != nil {
+		c.handleError(ConnectError{err})
+	}
 	return err
 }
 
@@ -1350,7 +1591,11 @@ type StreamPosition struct {
 	Epoch  string
 }
 
-func (c *Client) sendSubscribe(channel string, data []byte, recover bool, streamPos StreamPosition, token string, positioned bool, recoverable bool, joinLeave bool, fn func(res *protocol.SubscribeResult, err error)) error {
+func (c *Client) sendSubscribe(
+	channel string, data []byte, recover bool, streamPos StreamPosition, token string,
+	positioned bool, recoverable bool, joinLeave bool, deltaType DeltaType,
+	fn func(res *protocol.SubscribeResult, err error),
+) error {
 	params := &protocol.SubscribeRequest{
 		Channel: channel,
 	}
@@ -1367,6 +1612,10 @@ func (c *Client) sendSubscribe(channel string, data []byte, recover bool, stream
 	params.Positioned = positioned
 	params.Recoverable = recoverable
 	params.JoinLeave = joinLeave
+
+	if deltaType != DeltaTypeNone {
+		params.Delta = string(deltaType)
+	}
 
 	cmd := &protocol.Command{
 		Id: c.nextCmdID(),
@@ -1822,6 +2071,9 @@ func (c *Client) send(cmd *protocol.Command) error {
 	transport := c.transport
 	if transport == nil {
 		return ErrClientDisconnected
+	}
+	if c.logLevelEnabled(LogLevelTrace) {
+		c.traceOutCmd(cmd)
 	}
 	err := transport.Write(cmd, c.config.WriteTimeout)
 	if err != nil {
