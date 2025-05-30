@@ -1,7 +1,7 @@
 package centrifuge
 
 import (
-	"sync"
+	"context"
 	"sync/atomic"
 	"time"
 )
@@ -9,55 +9,87 @@ import (
 // cbQueue allows processing callbacks in separate goroutine with
 // preserved order.
 type cbQueue struct {
-	callbacks chan *asyncCB
-	mu        sync.Mutex
-	closed    atomic.Bool
+	callbacks *List[*asyncCB] // Using a List to preserve order and allow blocking operations.
+	closeCh   chan struct{}   // Channel to signal that the queue is closed.
+	closed    atomic.Bool     // Atomic boolean to check if the queue is closed.
 }
 
 func newCBQueue(buffSize int) *cbQueue {
 	return &cbQueue{
-		callbacks: make(chan *asyncCB, buffSize),
+		callbacks: NewList[*asyncCB](),
+		closeCh:   make(chan struct{}),
 	}
 }
 
 type asyncCB struct {
-	fn func(delay time.Duration)
-	tm time.Time
+	ready chan chan struct{} // Channel to signal that the callback is ready to be executed.
 }
 
 // dispatch is responsible for calling async callbacks. Should be run
 // in separate goroutine.
 func (q *cbQueue) dispatch() {
-	for cb := range q.callbacks {
-		if cb == nil {
-			continue
+	for {
+		select {
+		case <-q.closeCh:
+			return
+		default:
+			q.dispatchOne()
 		}
-		delay := time.Since(cb.tm)
-		cb.fn(delay)
+	}
+}
+
+func (q *cbQueue) dispatchOne() {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		defer cancel()
+		<-q.closeCh
+	}()
+	v, err := q.callbacks.PopFrontCtx(ctx)
+	if err != nil {
+		return
+	}
+	// signal that we are ready to execute the callback
+	done := make(chan struct{})
+	select {
+	case <-ctx.Done():
+		return
+	case v.ready <- done:
+	}
+
+	// wait for fn to finish
+	select {
+	case <-ctx.Done():
+		return
+	case <-done:
 	}
 }
 
 // Push adds the given function to the tail of the list and
 // signals the dispatcher.
 func (q *cbQueue) push(f func(duration time.Duration)) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.closed.Load() {
-		// If queue is closed, we ignore the callback.
+	select {
+	case <-q.closeCh:
 		return
+	default:
 	}
-	cb := &asyncCB{fn: f, tm: time.Now()}
-	q.callbacks <- cb
+	start := time.Now()
+	cb := &asyncCB{ready: make(chan chan struct{}, 1)}
+	q.callbacks.PushBack(cb)
+	if done, ok := <-cb.ready; ok {
+		f(time.Since(start))
+		close(done)
+	}
 }
 
 // Close signals that async queue must be closed.
 // Queue won't accept any more callbacks after that – ignoring them if pushed.
 func (q *cbQueue) close() {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	if q.closed.Load() {
-		return
+	if q.closed.Swap(true) {
+		return // Already closed, do nothing.
 	}
-	q.closed.Store(true)
-	close(q.callbacks)
+	close(q.closeCh)
+	// Drain the queue to ensure all callbacks are processed before closing.
+	for q.callbacks.Len() > 0 {
+		q.dispatchOne()
+	}
 }
