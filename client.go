@@ -139,10 +139,7 @@ func newClient(endpoint string, isProtobuf bool, config Config) *Client {
 	}
 
 	// Queue to run callbacks on.
-	client.cbQueue = &cbQueue{
-		closeCh: make(chan struct{}),
-	}
-	client.cbQueue.cond = sync.NewCond(&client.cbQueue.mu)
+	client.cbQueue = newCBQueue(1)
 	go client.cbQueue.dispatch()
 
 	return client
