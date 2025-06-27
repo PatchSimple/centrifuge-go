@@ -42,7 +42,8 @@ func main() {
 	logFileName := fmt.Sprintf("dummy_agent_%s.log", timestamp)
 	logFile, err := os.Create(logFileName)
 	if err != nil {
-		panic("failed to create dummy agent")
+		slog.Error("failed to create dummy agent log", "reason", err)
+		os.Exit(1)
 	}
 	defer logFile.Close()
 	multiLogger := io.MultiWriter(os.Stdout, logFile)
