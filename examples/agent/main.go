@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,17 @@ func init() {
 }
 
 func main() {
+	timestamp := time.Now().Format("20060102_150405")
+	logFileName := fmt.Sprintf("dummy_agent_%s.log", timestamp)
+	logFile, err := os.Create(logFileName)
+	if err != nil {
+		panic("failed to create dummy agent")
+	}
+	defer logFile.Close()
+	multiLogger := io.MultiWriter(os.Stdout, logFile)
+	slog.SetDefault(slog.New(slog.NewJSONHandler(multiLogger, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})))
 	slog.Info("starting",
 		"commit", Commit,
 		"pid", os.Getpid(),
@@ -55,6 +67,9 @@ func main() {
 
 func servePprof() {
 	// pprof mutates the default http server.
+	previousMutexProfileFraction := runtime.SetMutexProfileFraction(1)
+	slog.Info("pprof profiling", "previousMutexProfileFraction", previousMutexProfileFraction)
+	runtime.SetBlockProfileRate(1)
 	if err := http.ListenAndServe("localhost:6060", nil); !errors.Is(err, http.ErrServerClosed) {
 		slog.Error("failed to serve pprof", "reason", err)
 	}
