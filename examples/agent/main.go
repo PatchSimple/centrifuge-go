@@ -31,12 +31,6 @@ const (
 	defaultTokenExeFilename = "token.exe"
 )
 
-func init() {
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	})))
-}
-
 func main() {
 	timestamp := time.Now().Format("20060102_150405")
 	logFileName := fmt.Sprintf("dummy_agent_%s.log", timestamp)
