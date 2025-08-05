@@ -31,3 +31,6 @@ _testmain.go
 
 *.orig
 examples/benchmark/benchmark
+
+# AI Configs for upstream
+CLAUDE.md

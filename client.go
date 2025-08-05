@@ -953,8 +953,8 @@ func (c *Client) startReconnecting() error {
 		}
 		c.reconnectAttempts++
 		reconnectDelay := c.getReconnectDelay()
-		c.reconnectTimer = c.reconnectAfter(reconnectDelay)
 		c.mu.Unlock()
+		c.reconnectTimer = c.reconnectAfter(reconnectDelay)
 		return err
 	}
 
@@ -1175,10 +1175,12 @@ func (c *Client) startReconnecting() error {
 		_ = t.Close()
 		c.reconnectAttempts++
 		reconnectDelay := c.getReconnectDelay()
+		c.mu.Unlock()
 		c.reconnectTimer = c.reconnectAfter(reconnectDelay)
 		c.handleError(ConnectError{err})
+	} else {
+		c.mu.Unlock()
 	}
-	c.mu.Unlock()
 	return err
 }
 
