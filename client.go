@@ -2044,6 +2044,11 @@ func (c *Client) sendAsync(cmd *protocol.Command, cb func(*protocol.Reply, error
 
 	err := c.send(cmd)
 	if err != nil {
+		// Only one side may settle a request. If a concurrent teardown already took
+		// it from c.requests (and will run cb), report nothing here.
+		if !c.popRequest(cmd.Id) {
+			return nil
+		}
 		return err
 	}
 	go func() {
@@ -2103,6 +2108,15 @@ func (c *Client) removeRequest(id uint32) {
 	c.requestsMu.Lock()
 	defer c.requestsMu.Unlock()
 	delete(c.requests, id)
+}
+
+// popRequest removes the pending request for id and reports whether it was still pending.
+func (c *Client) popRequest(id uint32) bool {
+	c.requestsMu.Lock()
+	defer c.requestsMu.Unlock()
+	_, ok := c.requests[id]
+	delete(c.requests, id)
+	return ok
 }
 
 type disconnect struct {
