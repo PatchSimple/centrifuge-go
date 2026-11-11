@@ -1,8 +1,8 @@
 package centrifuge
 
-// Regression tests ported from upstream centrifugal/centrifuge-go for
-// request settlement: a request callback must run exactly once, and a call
-// whose send fails during connection teardown must return.
+// Request settlement tests from upstream centrifugal/centrifuge-go #127 and
+// #142: a request callback runs exactly once, and a call whose send fails
+// during a teardown returns.
 
 import (
 	"context"
@@ -15,8 +15,6 @@ import (
 	"github.com/centrifugal/protocol"
 )
 
-// Ported from upstream centrifugal/centrifuge-go#127 (c86a2add).
-
 // noopTransport is a transport whose Write always succeeds without actually
 // sending anything anywhere, so sendAsync's ReadTimeout goroutine gets
 // started without needing a real connection.
@@ -26,19 +24,10 @@ func (noopTransport) Read() (*protocol.Reply, *disconnect, error)  { return nil,
 func (noopTransport) Write(*protocol.Command, time.Duration) error { return nil }
 func (noopTransport) Close() error                                 { return nil }
 
-// TestClient_RequestCallbackNotInvokedTwiceOnTimeoutRace is a regression test
-// for a race where a reply arriving at almost the same moment its ReadTimeout
-// fired could invoke the same request's callback twice: once from handle()
-// with the real reply, once from the sendAsync timeout goroutine with
-// ErrTimeout. Since callers resolve via a buffered channel of size 1, the
-// second invocation used to block forever, leaking a goroutine.
-//
-// The callback below sleeps briefly after being invoked to widen the window
-// between "request found pending" and "request removed from the map" -
-// before the fix that window spanned the callback's own execution, so any
-// concurrent racer would still find the request present and invoke it too.
-// With the fix, the request is popped from the map atomically before its
-// callback runs, so a concurrent racer always finds it already gone.
+// TestClient_RequestCallbackNotInvokedTwiceOnTimeoutRace delivers a reply while
+// the request's ReadTimeout fires, and checks that the callback runs once. The
+// callback outlasts callTimeoutGrace, so the timeout path looks the request up
+// while the reply's callback is still running.
 func TestClient_RequestCallbackNotInvokedTwiceOnTimeoutRace(t *testing.T) {
 	config := Config{ReadTimeout: time.Microsecond}
 	c := NewJsonClient("ws://localhost:9000/connection/websocket", config)
@@ -52,8 +41,6 @@ func TestClient_RequestCallbackNotInvokedTwiceOnTimeoutRace(t *testing.T) {
 		done := make(chan struct{}, 2)
 		cb := func(reply *protocol.Reply, err error) {
 			atomic.AddInt32(&calls, 1)
-			// Outlast callTimeoutGrace, so the timeout goroutine looks the
-			// request up while this callback is still running.
 			time.Sleep(callTimeoutGrace + 20*time.Millisecond)
 			done <- struct{}{}
 		}
@@ -78,8 +65,6 @@ func TestClient_RequestCallbackNotInvokedTwiceOnTimeoutRace(t *testing.T) {
 		}
 	}
 }
-
-// Ported from upstream centrifugal/centrifuge-go#142 (d9267395).
 
 // failingWriteTransport fails every write after running beforeFail, a hook to
 // interleave a teardown with the failing write.
