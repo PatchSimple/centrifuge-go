@@ -52,7 +52,9 @@ func TestClient_RequestCallbackNotInvokedTwiceOnTimeoutRace(t *testing.T) {
 		done := make(chan struct{}, 2)
 		cb := func(reply *protocol.Reply, err error) {
 			atomic.AddInt32(&calls, 1)
-			time.Sleep(20 * time.Millisecond)
+			// Outlast callTimeoutGrace, so the timeout goroutine looks the
+			// request up while this callback is still running.
+			time.Sleep(callTimeoutGrace + 20*time.Millisecond)
 			done <- struct{}{}
 		}
 
@@ -70,7 +72,7 @@ func TestClient_RequestCallbackNotInvokedTwiceOnTimeoutRace(t *testing.T) {
 			t.Fatalf("request %d: callback was never invoked", cmd.Id)
 		}
 		// Give the loser of the race a chance to (incorrectly) also fire.
-		time.Sleep(30 * time.Millisecond)
+		time.Sleep(callTimeoutGrace + 30*time.Millisecond)
 		if got := atomic.LoadInt32(&calls); got != 1 {
 			t.Fatalf("request %d: callback invoked %d times, want 1", cmd.Id, got)
 		}
@@ -78,6 +80,7 @@ func TestClient_RequestCallbackNotInvokedTwiceOnTimeoutRace(t *testing.T) {
 }
 
 // Ported from upstream centrifugal/centrifuge-go#142 (d9267395).
+
 // failingWriteTransport fails every write after running beforeFail, a hook to
 // interleave a teardown with the failing write.
 type failingWriteTransport struct {
