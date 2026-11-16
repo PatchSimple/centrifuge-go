@@ -1696,22 +1696,86 @@ func (c *Client) onConnect(fn func(err error)) {
 // PublishResult contains the result of publish.
 type PublishResult struct{}
 
-// Publish data into channel.
+// Publish publishes data into channel and waits for the server's reply. It
+// first waits for the client to connect, for up to Config.ReadTimeout. When
+// ctx has no deadline, Config.ReadTimeout also bounds the wait for the reply.
+// Config.WriteTimeout and the deadline of ctx, whichever comes first, bound
+// the write. Publish returns as soon as ctx is done, unless a write is in
+// progress, in which case it returns when the write ends.
+//
+// Publish returns [ErrClientClosed] when the client is closed,
+// [ErrClientDisconnected] when the client disconnects before the reply
+// arrives, [ErrTimeout] when Config.ReadTimeout passes, [io.EOF] when the
+// write fails, a [*Error] when the server rejects the publication, and
+// ctx.Err() when ctx is done first.
 func (c *Client) Publish(ctx context.Context, channel string, data []byte) (PublishResult, error) {
 	if c.isClosed() {
 		return PublishResult{}, ErrClientClosed
 	}
-	resCh := make(chan PublishResult, 1)
-	errCh := make(chan error, 1)
-	c.publish(ctx, channel, data, func(result PublishResult, err error) {
-		resCh <- result
-		errCh <- err
+	if err := c.waitConnected(ctx); err != nil {
+		return PublishResult{}, err
+	}
+	reqCtx := ctx
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		reqCtx, cancel = context.WithTimeout(ctx, c.config.ReadTimeout)
+		defer cancel()
+	}
+	cmd := &protocol.Command{
+		Id: c.nextCmdID(),
+		Publish: &protocol.PublishRequest{
+			Channel: channel,
+			Data:    protocol.Raw(data),
+		},
+	}
+	done := make(chan requestResult, 1)
+	c.addRequest(cmd.Id, func(r *protocol.Reply, err error) {
+		select {
+		case done <- requestResult{reply: r, err: err}:
+		default:
+		}
+	})
+	defer c.removeRequest(cmd.Id)
+	timeout := c.config.WriteTimeout
+	if dl, ok := reqCtx.Deadline(); ok {
+		timeout = min(timeout, time.Until(dl))
+	}
+	// The transport treats a non-positive timeout as no deadline at all.
+	if timeout > 0 {
+		if err := c.sendTimeout(cmd, timeout); err != nil && c.popRequest(cmd.Id) {
+			return PublishResult{}, err
+		}
+	}
+	select {
+	case res := <-done:
+		if res.err != nil {
+			return PublishResult{}, res.err
+		}
+		if res.reply.Error != nil {
+			return PublishResult{}, errorFromProto(res.reply.Error)
+		}
+		return PublishResult{}, nil
+	case <-reqCtx.Done():
+		if err := ctx.Err(); err != nil {
+			return PublishResult{}, err
+		}
+		return PublishResult{}, ErrTimeout
+	}
+}
+
+func (c *Client) waitConnected(ctx context.Context) error {
+	connected := make(chan error, 1)
+	c.onConnect(func(err error) {
+		connected <- err
 	})
 	select {
+	case err := <-connected:
+		if err != nil {
+			return err
+		}
+		return ctx.Err()
 	case <-ctx.Done():
-		return PublishResult{}, ctx.Err()
-	case res := <-resCh:
-		return res, <-errCh
+		return ctx.Err()
 	}
 }
 
@@ -2074,6 +2138,10 @@ func (c *Client) sendAsync(cmd *protocol.Command, cb func(*protocol.Reply, error
 }
 
 func (c *Client) send(cmd *protocol.Command) error {
+	return c.sendTimeout(cmd, c.config.WriteTimeout)
+}
+
+func (c *Client) sendTimeout(cmd *protocol.Command, timeout time.Duration) error {
 	transport := c.transport
 	if transport == nil {
 		return ErrClientDisconnected
@@ -2081,7 +2149,7 @@ func (c *Client) send(cmd *protocol.Command) error {
 	if c.logLevelEnabled(LogLevelTrace) {
 		c.traceOutCmd(cmd)
 	}
-	err := transport.Write(cmd, c.config.WriteTimeout)
+	err := transport.Write(cmd, timeout)
 	if err != nil {
 		go c.handleDisconnect(&disconnect{Code: connectingTransportClosed, Reason: "write error", Reconnect: true})
 		return io.EOF
@@ -2103,6 +2171,19 @@ func (c *Client) removeRequest(id uint32) {
 	c.requestsMu.Lock()
 	defer c.requestsMu.Unlock()
 	delete(c.requests, id)
+}
+
+func (c *Client) popRequest(id uint32) bool {
+	c.requestsMu.Lock()
+	defer c.requestsMu.Unlock()
+	_, ok := c.requests[id]
+	delete(c.requests, id)
+	return ok
+}
+
+type requestResult struct {
+	reply *protocol.Reply
+	err   error
 }
 
 type disconnect struct {
