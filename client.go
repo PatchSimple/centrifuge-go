@@ -1700,8 +1700,9 @@ type PublishResult struct{}
 // first waits for the client to connect, for up to Config.ReadTimeout. When
 // ctx has no deadline, Config.ReadTimeout also bounds the wait for the reply.
 // Config.WriteTimeout and the deadline of ctx, whichever comes first, bound
-// the write. Publish returns as soon as ctx is done, unless a write is in
-// progress, in which case it returns when the write ends.
+// the write. A negative Config.WriteTimeout leaves only the deadline. Publish
+// returns as soon as ctx is done, unless a write is in progress, in which
+// case it returns when the write ends.
 //
 // Publish returns [ErrClientClosed] when the client is closed,
 // [ErrClientDisconnected] when the client disconnects before the reply
@@ -1736,13 +1737,9 @@ func (c *Client) Publish(ctx context.Context, channel string, data []byte) (Publ
 		}
 	})
 	defer c.removeRequest(cmd.Id)
-	timeout := c.config.WriteTimeout
-	if dl, ok := reqCtx.Deadline(); ok {
-		timeout = min(timeout, time.Until(dl))
-	}
-	// The transport treats a non-positive timeout as no deadline at all.
-	if timeout > 0 {
-		if err := c.sendTimeout(cmd, timeout); err != nil && c.popRequest(cmd.Id) {
+	dl, _ := reqCtx.Deadline()
+	if timeout, ok := writeTimeout(dl, c.config.WriteTimeout); ok {
+		if err := c.sendTimeout(c.currentTransport(), cmd, timeout); err != nil && c.popRequest(cmd.Id) {
 			return PublishResult{}, err
 		}
 	}
@@ -1770,13 +1767,26 @@ func (c *Client) waitConnected(ctx context.Context) error {
 	})
 	select {
 	case err := <-connected:
-		if err != nil {
-			return err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
 		}
-		return ctx.Err()
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+// writeTimeout returns false when deadline has passed, because the transport
+// treats a non-positive timeout as no deadline at all.
+func writeTimeout(deadline time.Time, limit time.Duration) (time.Duration, bool) {
+	left := time.Until(deadline)
+	if left <= 0 {
+		return 0, false
+	}
+	if limit <= 0 {
+		return left, true
+	}
+	return min(limit, left), true
 }
 
 func (c *Client) publish(ctx context.Context, channel string, data []byte, fn func(PublishResult, error)) {
@@ -2138,11 +2148,16 @@ func (c *Client) sendAsync(cmd *protocol.Command, cb func(*protocol.Reply, error
 }
 
 func (c *Client) send(cmd *protocol.Command) error {
-	return c.sendTimeout(cmd, c.config.WriteTimeout)
+	return c.sendTimeout(c.transport, cmd, c.config.WriteTimeout)
 }
 
-func (c *Client) sendTimeout(cmd *protocol.Command, timeout time.Duration) error {
-	transport := c.transport
+func (c *Client) currentTransport() transport {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.transport
+}
+
+func (c *Client) sendTimeout(transport transport, cmd *protocol.Command, timeout time.Duration) error {
 	if transport == nil {
 		return ErrClientDisconnected
 	}

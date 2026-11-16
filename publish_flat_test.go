@@ -302,7 +302,7 @@ func TestClient_PublishReturnsPromptlyOnCancelWhileConnecting(t *testing.T) {
 	})
 }
 
-func TestClient_PublishSkipsWriteWhenContextIsDone(t *testing.T) {
+func TestClient_PublishChecksContextAfterConnect(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		writes := 0
 		c := newTestClient(t, StateConnected, func(*protocol.Command, time.Duration) error {
@@ -319,4 +319,90 @@ func TestClient_PublishSkipsWriteWhenContextIsDone(t *testing.T) {
 			t.Fatalf("got %d writes, want 0", writes)
 		}
 	})
+}
+
+func TestClient_PublishReturnsContextErrorWhenDisconnected(t *testing.T) {
+	c := newTestClient(t, StateDisconnected, nil)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	// The connect result and ctx.Done() are both ready, so select picks one at
+	// random. Repeating makes a wrong pick show up.
+	for range 100 {
+		_, err := c.Publish(ctx, "ch", []byte("data"))
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v, want context.Canceled", err)
+		}
+	}
+}
+
+func TestClient_PublishWritesWithNegativeWriteTimeout(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var c *Client
+		writeTimeout := make(chan time.Duration, 1)
+		c = newTestClient(t, StateConnected, func(cmd *protocol.Command, timeout time.Duration) error {
+			writeTimeout <- timeout
+			c.handle(&protocol.Reply{Id: cmd.Id})
+			return nil
+		})
+		c.config.WriteTimeout = -1
+		_, err := c.Publish(t.Context(), "ch", []byte("data"))
+		if err != nil {
+			t.Fatalf("got %v, want nil", err)
+		}
+		if got := <-writeTimeout; got != c.config.ReadTimeout {
+			t.Fatalf("write timeout %v, want ReadTimeout %v", got, c.config.ReadTimeout)
+		}
+	})
+}
+
+func TestClient_PublishReadsTransportUnderLock(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := newTestClient(t, StateConnecting, nil)
+		var err error
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			_, err = c.Publish(t.Context(), "ch", []byte("data"))
+		})
+		synctest.Wait()
+		c.mu.Lock()
+		c.state = StateConnected
+		c.transport = &fakeTransport{write: func(*protocol.Command, time.Duration) error { return nil }}
+		c.resolveConnectFutures(nil)
+		c.mu.Unlock()
+		// Publish resumes after the connect, so this write races with its read
+		// of the transport unless that read holds c.mu. Run with -race.
+		c.mu.Lock()
+		c.transport = nil
+		c.mu.Unlock()
+		wg.Wait()
+		if err == nil {
+			t.Fatal("got nil, want an error")
+		}
+	})
+}
+
+func Test_writeTimeout(t *testing.T) {
+	cases := []struct {
+		name     string
+		deadline time.Duration
+		limit    time.Duration
+		want     time.Duration
+		wantOK   bool
+	}{
+		{"limit_comes_first", 5 * time.Second, time.Second, time.Second, true},
+		{"deadline_comes_first", time.Second, 5 * time.Second, time.Second, true},
+		{"negative_limit_leaves_deadline", 5 * time.Second, -1, 5 * time.Second, true},
+		{"deadline_now_skips_write", 0, time.Second, 0, false},
+		{"passed_deadline_skips_write", -time.Second, time.Second, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				got, ok := writeTimeout(time.Now().Add(tc.deadline), tc.limit)
+				if got != tc.want || ok != tc.wantOK {
+					t.Fatalf("got (%v, %v), want (%v, %v)", got, ok, tc.want, tc.wantOK)
+				}
+			})
+		})
+	}
 }
