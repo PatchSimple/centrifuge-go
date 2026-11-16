@@ -786,15 +786,10 @@ func (c *Client) handle(reply *protocol.Reply) {
 		if c.logLevelEnabled(LogLevelTrace) {
 			c.traceInReply(reply)
 		}
-		c.requestsMu.RLock()
-		req, ok := c.requests[reply.Id]
-		c.requestsMu.RUnlock()
-		if ok {
-			if req.cb != nil {
-				req.cb(reply, nil)
-			}
+		req, ok := c.popRequest(reply.Id)
+		if ok && req.cb != nil {
+			req.cb(reply, nil)
 		}
-		c.removeRequest(reply.Id)
 	} else {
 		if reply.Push == nil {
 			if c.logLevelEnabled(LogLevelTrace) {
@@ -2039,31 +2034,41 @@ func (c *Client) sendUnsubscribe(channel string, fn func(UnsubscribeResult, erro
 	}
 }
 
+// callTimeoutGrace is how long a call whose timeout fired still waits for a
+// reply that was received but not processed yet.
+const callTimeoutGrace = 50 * time.Millisecond
+
 func (c *Client) sendAsync(cmd *protocol.Command, cb func(*protocol.Reply, error)) error {
 	c.addRequest(cmd.Id, cb)
 
 	err := c.send(cmd)
 	if err != nil {
+		// The caller handles the error, so cb must not run as well. A teardown
+		// racing with the failed send may have taken the request already and
+		// run cb with ErrClientDisconnected: then the caller must not handle it.
+		if _, ok := c.popRequest(cmd.Id); !ok {
+			return nil
+		}
 		return err
 	}
 	go func() {
 		c.mu.Lock()
 		closeCh := c.closeCh
 		c.mu.Unlock()
-		defer c.removeRequest(cmd.Id)
 		select {
 		case <-time.After(c.config.ReadTimeout):
-			c.requestsMu.RLock()
-			req, ok := c.requests[cmd.Id]
-			c.requestsMu.RUnlock()
+			// The reply may have been received already but not processed yet,
+			// e.g. when a suspended process resumes and this overdue timer runs
+			// before the reader handles the data waiting in the socket. Let that
+			// data be processed first, like centrifuge-js does.
+			time.Sleep(callTimeoutGrace)
+			req, ok := c.popRequest(cmd.Id)
 			if !ok {
 				return
 			}
 			req.cb(nil, ErrTimeout)
 		case <-closeCh:
-			c.requestsMu.RLock()
-			req, ok := c.requests[cmd.Id]
-			c.requestsMu.RUnlock()
+			req, ok := c.popRequest(cmd.Id)
 			if !ok {
 				return
 			}
@@ -2099,10 +2104,17 @@ func (c *Client) addRequest(id uint32, cb func(*protocol.Reply, error)) {
 	c.requests[id] = request{cb}
 }
 
-func (c *Client) removeRequest(id uint32) {
+// popRequest atomically looks up and removes the request with the given id,
+// so that only one caller (the actual reply, a timeout, or a close) can ever
+// observe it and invoke its callback.
+func (c *Client) popRequest(id uint32) (request, bool) {
 	c.requestsMu.Lock()
 	defer c.requestsMu.Unlock()
-	delete(c.requests, id)
+	req, ok := c.requests[id]
+	if ok {
+		delete(c.requests, id)
+	}
+	return req, ok
 }
 
 type disconnect struct {
