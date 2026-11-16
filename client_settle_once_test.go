@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -37,6 +38,7 @@ func (noopTransport) Close() error                                 { return nil 
 func TestClient_RequestCallbackNotInvokedTwiceOnTimeoutRace(t *testing.T) {
 	config := Config{ReadTimeout: time.Microsecond}
 	c := NewJsonClient("ws://localhost:9000/connection/websocket", config)
+	defer c.Close()
 	c.transport = noopTransport{}
 	c.closeCh = make(chan struct{})
 
@@ -143,5 +145,121 @@ func TestCallReturnsWhenSendFailsDuringTeardown(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Publish never returned after its send failed during a teardown, despite its 1s context")
+	}
+}
+
+// hangTimeout only reports a hang. A passing run never waits for it.
+const hangTimeout = 10 * time.Second
+
+func waitFor[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(hangTimeout):
+		t.Fatalf("%s did not happen within %v", what, hangTimeout)
+		panic("unreachable")
+	}
+}
+
+// blockingCallback counts the calls of a request callback. The first call
+// reports its error on first and then blocks until release is closed, so that a
+// test can make a second settle attempt while the first callback still runs.
+type blockingCallback struct {
+	mu      sync.Mutex
+	calls   int
+	first   chan error
+	release chan struct{}
+}
+
+func newBlockingCallback() *blockingCallback {
+	return &blockingCallback{first: make(chan error, 1), release: make(chan struct{})}
+}
+
+func (b *blockingCallback) cb(_ *protocol.Reply, err error) {
+	b.mu.Lock()
+	b.calls++
+	n := b.calls
+	b.mu.Unlock()
+	if n == 1 {
+		b.first <- err
+		<-b.release
+	}
+}
+
+func (b *blockingCallback) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.calls
+}
+
+// newWritableClient returns a client whose writes succeed and go nowhere, so a
+// test plays the server by calling handle.
+func newWritableClient(t *testing.T, readTimeout time.Duration) (*Client, chan struct{}) {
+	t.Helper()
+	c := NewJsonClient("ws://127.0.0.1:1/connection/websocket", Config{ReadTimeout: readTimeout})
+	t.Cleanup(c.Close)
+	closeCh := make(chan struct{})
+	c.mu.Lock()
+	c.transport = noopTransport{}
+	c.closeCh = closeCh
+	c.mu.Unlock()
+	return c, closeCh
+}
+
+func TestClient_sendAsyncRemovesRequestWhenSendFails(t *testing.T) {
+	c := NewProtobufClient("ws://127.0.0.1:1/connection/websocket", Config{})
+	t.Cleanup(c.Close)
+	cmd := &protocol.Command{Id: c.nextCmdID()}
+	// Holding the client lock keeps the teardown that the failed send starts
+	// from running before the request is checked.
+	c.mu.Lock()
+	c.state = StateConnected
+	c.transport = &failingWriteTransport{}
+	err := c.sendAsync(cmd, func(*protocol.Reply, error) {})
+	c.requestsMu.RLock()
+	_, pending := c.requests[cmd.Id]
+	c.requestsMu.RUnlock()
+	c.mu.Unlock()
+	if err == nil {
+		t.Fatal("sendAsync returned nil for a failed send that nothing else settled")
+	}
+	if pending {
+		t.Fatal("the request is still pending after sendAsync returned its error, so the teardown settles it a second time")
+	}
+}
+
+func TestClient_sendAsyncDropsLateReplyAfterTimeout(t *testing.T) {
+	c, _ := newWritableClient(t, time.Nanosecond)
+	b := newBlockingCallback()
+	defer close(b.release)
+	cmd := &protocol.Command{Id: c.nextCmdID()}
+	if err := c.sendAsync(cmd, b.cb); err != nil {
+		t.Fatalf("sendAsync: %v", err)
+	}
+	if err := waitFor(t, b.first, "the timeout settling the request"); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("first settle got %v, want %v", err, ErrTimeout)
+	}
+	c.handle(&protocol.Reply{Id: cmd.Id})
+	if n := b.count(); n != 1 {
+		t.Fatalf("callback ran %d times, want 1: the reply settled a request that the timeout had settled", n)
+	}
+}
+
+func TestClient_sendAsyncDropsLateReplyAfterClose(t *testing.T) {
+	c, closeCh := newWritableClient(t, time.Hour)
+	b := newBlockingCallback()
+	defer close(b.release)
+	cmd := &protocol.Command{Id: c.nextCmdID()}
+	if err := c.sendAsync(cmd, b.cb); err != nil {
+		t.Fatalf("sendAsync: %v", err)
+	}
+	close(closeCh)
+	if err := waitFor(t, b.first, "the close settling the request"); !errors.Is(err, ErrClientDisconnected) {
+		t.Fatalf("first settle got %v, want %v", err, ErrClientDisconnected)
+	}
+	c.handle(&protocol.Reply{Id: cmd.Id})
+	if n := b.count(); n != 1 {
+		t.Fatalf("callback ran %d times, want 1: the reply settled a request that the close had settled", n)
 	}
 }
