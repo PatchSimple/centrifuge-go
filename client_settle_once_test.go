@@ -28,6 +28,12 @@ func (noopTransport) Close() error                                 { return nil 
 // the request's ReadTimeout fires, and checks that the callback runs once. The
 // callback outlasts callTimeoutGrace, so the timeout path looks the request up
 // while the reply's callback is still running.
+//
+// Its waits are timed on purpose. The reply and the timeout race in two
+// goroutines with no hook to order them, and the test repeats the race to hit
+// both orders. The final wait checks that a second call never happens, which
+// needs a window: it outlasts the timeout path's grace, after which that path
+// has either taken the request or found it gone.
 func TestClient_RequestCallbackNotInvokedTwiceOnTimeoutRace(t *testing.T) {
 	config := Config{ReadTimeout: time.Microsecond}
 	c := NewJsonClient("ws://localhost:9000/connection/websocket", config)
@@ -93,11 +99,30 @@ func TestCallReturnsWhenSendFailsDuringTeardown(t *testing.T) {
 	ft := &failingWriteTransport{}
 	ft.beforeFail = func() {
 		// The connection is torn down while the command is written: the
-		// teardown fails every pending request, this one included.
+		// teardown fails every pending request, this one included. It runs
+		// the callbacks in goroutines, so wait until this request's callback
+		// has finished: the write then fails with the request already settled,
+		// which is the order that made Publish hang.
+		settled := make(chan struct{})
+		client.requestsMu.Lock()
+		for id, req := range client.requests {
+			cb := req.cb
+			client.requests[id] = request{cb: func(r *protocol.Reply, err error) {
+				cb(r, err)
+				close(settled)
+			}}
+		}
+		client.requestsMu.Unlock()
+
 		client.mu.Lock()
 		client.clearConnectedState()
 		client.mu.Unlock()
-		time.Sleep(50 * time.Millisecond)
+
+		select {
+		case <-settled:
+		case <-time.After(time.Second):
+			t.Error("the teardown never settled the pending request")
+		}
 	}
 	client.mu.Lock()
 	client.state = StateConnected
